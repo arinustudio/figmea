@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -51,6 +51,18 @@ public class playerController : MonoBehaviour
 
     public string currentInput = "";
 
+    [SerializeField, Min(0.01f)] private float laneSpacing = 2f;
+    [SerializeField, Min(0.001f)] private float turnTolerance = 0.1f;
+    private Vector3[] nextComposeRails = new Vector3[5];
+    private Vector3[] nextTurnPoints = new Vector3[5];
+    private bool hasPendingTurn = false;
+    private bool isTurning = false;
+    private float previousTurnSignedDistance = 0f;
+    private Vector2 previousTurnSamplePosition;
+    private int previousTurnLaneIndex = -1;
+    private bool hasPreviousTurnSample = false;
+    private bool turnPointCrossed = false;
+
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
     {
@@ -58,6 +70,21 @@ public class playerController : MonoBehaviour
 
         //permitidos: z+, z-, x+, x-, x+z+,x+z-, x-z-, x+z+
         currentAxis = currentAxis == "" ? "z+" : currentAxis;
+        hasPendingTurn = false;
+        isTurning = false;
+        ResetTurnPointTracking();
+
+        if (currentAxis.Length == 4 && currentComposeRailIndex >= 0 && currentComposeRailIndex <= 4)
+        {
+            rightCounter = currentComposeRailIndex - 2;
+        }
+        else
+        {
+            rightCounter = Mathf.Clamp(rightCounter, -2, 2);
+            currentComposeRailIndex = rightCounter + 2;
+        }
+
+        leftCounter = -rightCounter;
         currentRail = getCurrentRail();
         previousRail = currentRail;
     }
@@ -70,7 +97,7 @@ public class playerController : MonoBehaviour
 
     void FixedUpdate()
     {
-        if (nextAxis != "")
+        if (hasPendingTurn && !isTurning)
         {
             cornerTurning();
         }
@@ -169,6 +196,10 @@ public class playerController : MonoBehaviour
 
     private void react()
     {
+        if (isTurning)
+        {
+            return;
+        }
 
         if ((currentInput == "run" || boostTimer > 0) && leftTimer == 0 && rightTimer == 0 && slideTimer == 0)
         {
@@ -192,17 +223,7 @@ public class playerController : MonoBehaviour
         }
         else if ((currentInput == "left" || leftTimer > 0) && rightTimer == 0 && slideTimer == 0)
         {
-            if (leftTimer == 0 && leftCounter < 2)
-            {
-                leftTimer = player_data.movementDuration;
-                //player_rigidbody.linearVelocity = transform.right * -1 * boostedSpeed; //pendiente de adaptar
-                leftCounter++;
-                rightCounter--;
-                calcMoveTo("left");
-                animator.SetBool("left", true);
-                currentComposeRailIndex--;
-            }
-            else
+            if (leftTimer > 0)
             {
                 leftTimer -= Time.deltaTime;
                 if (leftTimer <= 0)
@@ -211,22 +232,24 @@ public class playerController : MonoBehaviour
                     leftTimer = 0;
                     animator.SetBool("left", false);
                 }
-
+            }
+            else if (currentInput == "left")
+            {
+                int targetLaneIndex = rightCounter - 1;
+                if (targetLaneIndex >= -2 && IsLaneTurnPointAhead(targetLaneIndex))
+                {
+                    calcMoveTo("left");
+                    rightCounter = targetLaneIndex;
+                    leftCounter = -rightCounter;
+                    currentComposeRailIndex = rightCounter + 2;
+                    leftTimer = player_data.movementDuration;
+                    animator.SetBool("left", true);
+                }
             }
         }
         else if ((currentInput == "right" || rightTimer > 0) && leftTimer == 0 && slideTimer == 0)
         {
-            if (rightTimer == 0 && rightCounter < 2)
-            {
-                rightTimer = player_data.movementDuration; ;
-                //player_rigidbody.linearVelocity = transform.right * boostedSpeed; //pendiente de adaptar
-                rightCounter++;
-                leftCounter--;
-                calcMoveTo("right");
-                animator.SetBool("right", true);
-                currentComposeRailIndex++;
-            }
-            else
+            if (rightTimer > 0)
             {
                 rightTimer -= Time.deltaTime;
                 if (rightTimer <= 0)
@@ -235,9 +258,20 @@ public class playerController : MonoBehaviour
                     rightTimer = 0;
                     animator.SetBool("right", false);
                 }
-
             }
-
+            else if (currentInput == "right")
+            {
+                int targetLaneIndex = rightCounter + 1;
+                if (targetLaneIndex <= 2 && IsLaneTurnPointAhead(targetLaneIndex))
+                {
+                    calcMoveTo("right");
+                    rightCounter = targetLaneIndex;
+                    leftCounter = -rightCounter;
+                    currentComposeRailIndex = rightCounter + 2;
+                    rightTimer = player_data.movementDuration;
+                    animator.SetBool("right", true);
+                }
+            }
         }
         else if ((currentInput == "slide" || slideTimer > 0) && rightTimer == 0 && leftTimer == 0)
         {
@@ -290,38 +324,62 @@ public class playerController : MonoBehaviour
 
     //}
 
+    private void ResetTurnPointTracking()
+    {
+        previousTurnSignedDistance = 0f;
+        previousTurnSamplePosition = Vector2.zero;
+        previousTurnLaneIndex = -1;
+        hasPreviousTurnSample = false;
+        turnPointCrossed = false;
+    }
+
     private void OnTriggerEnter(Collider other)
     {
-        if(other.gameObject.CompareTag("turnCollider"))
+        if (other.gameObject.CompareTag("turnCollider"))
         {
-            GameMaster.Instance.activeInput = false;
+            if (isTurning || hasPendingTurn)
+            {
+                return;
+            }
 
             turnController tc = other.gameObject.GetComponent<turnController>();
-
-            if (tc != null)
+            if (tc != null && tc.axis != null)
             {
-                var options = tc.axis
-                    ;
-
-                if(options.Length == 1)
+                var options = tc.axis;
+                if (options.Length == 1)
                 {
-                    if (options[0].Length == 4) // Diagonal
+                    string candidateAxis = options[0];
+                    if (Array.IndexOf(axisRadialDegrees, candidateAxis) == -1)
                     {
-                        nextAxis = options[0];
-                        nextComposeCenter = getNewComposeCenter(nextAxis, other.gameObject.transform);
-                        calcComposeRails();
+                        hasPendingTurn = false;
+                        nextAxis = "";
+                        ResetTurnPointTracking();
+                        Debug.LogWarning("OnTriggerEnter: Invalid axis option: " + candidateAxis);
+                        return;
+                    }
+
+                    nextAxis = candidateAxis;
+                    nextComposeCenter = new Vector3(other.transform.position.x, 0f, other.transform.position.z);
+
+                    bool railsOk = calcComposeRails();
+                    bool turnsOk = railsOk && CalculateNextTurnPoints();
+
+                    if (railsOk && turnsOk)
+                    {
+                        ResetTurnPointTracking();
+                        hasPendingTurn = true;
                     }
                     else
                     {
-                        nextAxis = options[0];
-                        nextCenter = getNewCenter(nextAxis, other.gameObject.transform.position);
+                        hasPendingTurn = false;
+                        nextAxis = "";
+                        ResetTurnPointTracking();
+                        Debug.LogWarning("OnTriggerEnter: Failed to calculate compose rails or turn points.");
                     }
-
                 }
             }
         }
     }
-
 
     private float getNewCenter(string axis, Vector3 newSidewalk)
     {
@@ -338,30 +396,129 @@ public class playerController : MonoBehaviour
         }
     }
 
-    public Vector3 getNewComposeCenter(string axis, Transform newSidewalk)
+    private Vector2 GetAxisDirection(string axis)
     {
-        // Punto sobre la recta actual (posición del jugador)
-        Vector2 A = new Vector2(transform.position.x, transform.position.z);
-        // Punto sobre la siguiente recta (centro del collider)
-        Vector2 B = new Vector2(newSidewalk.position.x, newSidewalk.position.z);
+        float angleRadians = axisToDegree(axis) * Mathf.Deg2Rad;
+        Vector2 direction = new Vector2(Mathf.Cos(angleRadians), Mathf.Sin(angleRadians));
+        return direction.normalized;
+    }
 
-        // Ángulos según tu convención (z+ adelante, x+ derecha)
-        float angleA = axisToDegree(currentAxis) * Mathf.Deg2Rad;
-        float angleB = axisToDegree(axis) * Mathf.Deg2Rad;
+    private Vector2[] GetCurrentRailAnchors()
+    {
+        if (currentAxis.Length == 4)
+        {
+            Vector2[] anchors = new Vector2[5];
+            for (int i = 0; i < 5; i++)
+            {
+                anchors[i] = new Vector2(composeCenters[i].x, composeCenters[i].z);
+                if (float.IsNaN(anchors[i].x) || float.IsNaN(anchors[i].y) || float.IsInfinity(anchors[i].x) || float.IsInfinity(anchors[i].y))
+                {
+                    Debug.LogWarning("GetCurrentRailAnchors: Compose anchor contains NaN or Infinity.");
+                    return null;
+                }
+            }
+            return anchors;
+        }
+        else if (currentAxis.Length == 2)
+        {
+            Vector2 direction = GetAxisDirection(currentAxis);
+            Vector2 right = new Vector2(direction.y, -direction.x);
+            Vector2 currentLanePoint = currentAxis[0] == 'z'
+                ? new Vector2(currentRail, transform.position.z)
+                : new Vector2(transform.position.x, currentRail);
 
-        // Direcciones unitarias de cada recta
-        Vector2 dA = new Vector2(Mathf.Cos(angleA), Mathf.Sin(angleA)); // rail actual
-        Vector2 dB = new Vector2(Mathf.Cos(angleB), Mathf.Sin(angleB)); // rail siguiente
+            Vector2 centralAnchor = currentLanePoint - right * (rightCounter * laneSpacing);
 
-        // Determinante (sabemos que no será 0 porque nunca son paralelas)
-        float det = dA.x * dB.y - dA.y * dB.x;
+            Vector2[] anchors = new Vector2[5];
+            for (int i = 0; i < 5; i++)
+            {
+                anchors[i] = centralAnchor + right * ((i - 2) * laneSpacing);
+                if (float.IsNaN(anchors[i].x) || float.IsNaN(anchors[i].y) || float.IsInfinity(anchors[i].x) || float.IsInfinity(anchors[i].y))
+                {
+                    Debug.LogWarning("GetCurrentRailAnchors: Orthogonal anchor contains NaN or Infinity.");
+                    return null;
+                }
+            }
+            return anchors;
+        }
+        else
+        {
+            Debug.LogWarning("GetCurrentRailAnchors: Invalid currentAxis: " + currentAxis);
+            return null;
+        }
+    }
 
-        Vector2 diff = B - A;
-        float t = (diff.x * dB.y - diff.y * dB.x) / det;
+    private bool TryGetLineIntersection(Vector2 pointA, Vector2 directionA, Vector2 pointB, Vector2 directionB, out Vector2 intersection)
+    {
+        float det = directionA.x * directionB.y - directionA.y * directionB.x;
+        if (Mathf.Abs(det) <= 0.0001f)
+        {
+            intersection = Vector2.zero;
+            return false;
+        }
 
-        Vector2 P = A + dA * t; // Punto de intersección
+        Vector2 diff = pointB - pointA;
+        float t = (diff.x * directionB.y - diff.y * directionB.x) / det;
+        intersection = pointA + directionA * t;
 
-        return new Vector3(P.x, 0f, P.y);
+        if (float.IsNaN(intersection.x) || float.IsNaN(intersection.y) || float.IsInfinity(intersection.x) || float.IsInfinity(intersection.y))
+        {
+            intersection = Vector2.zero;
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool CalculateNextTurnPoints()
+    {
+        Vector2[] currentAnchors = GetCurrentRailAnchors();
+        if (currentAnchors == null || currentAnchors.Length != 5)
+        {
+            return false;
+        }
+
+        Vector2 currentDirection = GetAxisDirection(currentAxis);
+        Vector2 nextDirection = GetAxisDirection(nextAxis);
+        Vector3[] calculatedPoints = new Vector3[5];
+
+        for (int i = 0; i < 5; i++)
+        {
+            Vector2 nextRailPoint = new Vector2(nextComposeRails[i].x, nextComposeRails[i].z);
+            Vector2 intersection;
+            if (!TryGetLineIntersection(currentAnchors[i], currentDirection, nextRailPoint, nextDirection, out intersection))
+            {
+                return false;
+            }
+            calculatedPoints[i] = new Vector3(intersection.x, 0f, intersection.y);
+        }
+
+        for (int i = 0; i < 5; i++)
+        {
+            nextTurnPoints[i] = calculatedPoints[i];
+        }
+
+        return true;
+    }
+
+    private bool IsLaneTurnPointAhead(int targetLaneIndex)
+    {
+        if (!hasPendingTurn)
+        {
+            return true;
+        }
+
+        if (targetLaneIndex < -2 || targetLaneIndex > 2)
+        {
+            return false;
+        }
+
+        Vector3 target = nextTurnPoints[targetLaneIndex + 2];
+        Vector2 targetXZ = new Vector2(target.x, target.z);
+        Vector2 playerXZ = new Vector2(transform.position.x, transform.position.z);
+        float signedDistance = Vector2.Dot(targetXZ - playerXZ, GetAxisDirection(currentAxis));
+
+        return signedDistance >= -turnTolerance;
     }
 
     private float axisToDegree(string axis)
@@ -459,38 +616,24 @@ public class playerController : MonoBehaviour
         return new Vector3(closestPoint.x, transform.position.y, closestPoint.y);
     }
 
-    private Vector3 calcMoveToFrom(string move, Vector3 position)
+    private bool calcComposeRails()
     {
-        float x = position.x;
-        float z = position.z;
-        Vector2 linePoint = new Vector2(x, z);
-        float angle = axisToDegree(nextAxis);
+        Vector2 centerXZ = new Vector2(nextComposeCenter.x, nextComposeCenter.z);
+        Vector2 direction = GetAxisDirection(nextAxis);
+        Vector2 right = new Vector2(direction.y, -direction.x);
 
-        float angleRad = Mathf.Deg2Rad * angle;
+        for (int i = 0; i < 5; i++)
+        {
+            float laneOffset = (i - 2) * laneSpacing;
+            Vector2 railPoint = centerXZ + right * laneOffset;
+            if (float.IsNaN(railPoint.x) || float.IsNaN(railPoint.y) || float.IsInfinity(railPoint.x) || float.IsInfinity(railPoint.y))
+            {
+                return false;
+            }
+            nextComposeRails[i] = new Vector3(railPoint.x, 0f, railPoint.y);
+        }
 
-        float perpendicularAngleRad = angleRad + (move == "left" ? Mathf.PI / 2 : -Mathf.PI / 2);
-
-        Vector2 perpendicularDirection = new Vector2(Mathf.Cos(perpendicularAngleRad), Mathf.Sin(perpendicularAngleRad));
-
-        Vector2 nextRail = linePoint + perpendicularDirection * 2f;
-
-        return new Vector3(nextRail.x, 0f, nextRail.y);
-    }
-
-    private void calcComposeRails()
-    {
-        Vector3 center = new Vector3(nextComposeCenter.x, 0f, nextComposeCenter.z);
-        Vector3 rightA = calcMoveToFrom("right", center);
-        Vector3 rightB = calcMoveToFrom("right", rightA);
-        Vector3 leftA = calcMoveToFrom("left", center);
-        Vector3 leftB = calcMoveToFrom("left", leftA);
-
-        composeCenters[0] = leftB;
-        composeCenters[1] = leftA;
-        composeCenters[2] = center;
-        composeCenters[3] = rightA;
-        composeCenters[4] = rightB;
-
+        return true;
     }
 
     private void calcMoveTo(string move)
@@ -500,12 +643,12 @@ public class playerController : MonoBehaviour
             if (((currentAxis == "z+" || currentAxis == "x-") && move == "left") || ((currentAxis == "z-" || currentAxis == "x+") && move == "right"))
             {
                 previousRail = currentRail;
-                currentRail = currentRail - 2f;
+                currentRail = currentRail - laneSpacing;
             }
             else
             {
                 previousRail = currentRail;
-                currentRail = currentRail + 2f;
+                currentRail = currentRail + laneSpacing;
             }
         }
         else
@@ -528,7 +671,7 @@ public class playerController : MonoBehaviour
             float perpendicularAngleRad = angleRad + (move == "left" ? Mathf.PI / 2 : -Mathf.PI / 2);
             Vector2 perpendicularDirection = new Vector2(Mathf.Cos(perpendicularAngleRad), Mathf.Sin(perpendicularAngleRad)).normalized;
 
-            Vector2 nextRail = projectedPoint + perpendicularDirection * 2f;
+            Vector2 nextRail = projectedPoint + perpendicularDirection * laneSpacing;
 
             previousComposeRail = currentComposeRail;
             currentComposeRail = new Vector3(nextRail.x, 0f, nextRail.y);
@@ -546,77 +689,135 @@ public class playerController : MonoBehaviour
 
     private void cornerTurning()
     {
-        if(nextAxis.Length == 4) // Diagonal
+        if (!hasPendingTurn || isTurning)
         {
-            Vector3 currentDirectionPosition = new Vector3(transform.position.x, 0f, transform.position.z);
-            Vector3 composeNextCenter = new Vector3(nextComposeCenter.x, 0f, nextComposeCenter.z);
-            const float umbral = 0.1f;
-            float distancia = Vector3.Distance(currentDirectionPosition, composeNextCenter);
+            return;
+        }
 
-            if (distancia < umbral)
+        int laneIndex = rightCounter + 2;
+        if (laneIndex < 0 || laneIndex > 4)
+        {
+            Debug.LogWarning("cornerTurning: laneIndex out of range: " + laneIndex);
+            hasPendingTurn = false;
+            nextAxis = "";
+            ResetTurnPointTracking();
+            return;
+        }
+
+        Vector3 target = nextTurnPoints[laneIndex];
+        Vector2 targetXZ = new Vector2(target.x, target.z);
+        Vector2 playerXZ = new Vector2(transform.position.x, transform.position.z);
+        float signedDistance = Vector2.Dot(targetXZ - playerXZ, GetAxisDirection(currentAxis));
+
+        bool sameLaneSample = hasPreviousTurnSample && previousTurnLaneIndex == laneIndex;
+
+        if (!sameLaneSample)
+        {
+            ResetTurnPointTracking();
+            previousTurnLaneIndex = laneIndex;
+            previousTurnSignedDistance = signedDistance;
+            previousTurnSamplePosition = playerXZ;
+            hasPreviousTurnSample = true;
+
+            if (signedDistance < -turnTolerance)
             {
-                rotationDegrees = getRotationDegrees();
-                //Quaternion targetRotation = Quaternion.Euler(transform.rotation.eulerAngles.x, transform.rotation.eulerAngles.y + rotationDegrees, transform.rotation.eulerAngles.z);
-                //player_rigidbody.MoveRotation(targetRotation);
-                forceStop = true;
-                currentAxis = nextAxis;
-                StartCoroutine(TurnRotation());
-                currentRail = 0;
-                previousRail = 0;
-                currentComposeRail = nextComposeCenter;
-                previousComposeRail = currentComposeRail;
-                currentComposeRailIndex = 2;
-                leftCounter = 0;
-                rightCounter = 0;
-                GameMaster.Instance.cameraRotation = rotationDegrees;
+                Debug.LogWarning("cornerTurning: Target intersection was already behind player at initial sampling (signedDistance=" + signedDistance + "). Cancelling pending turn.");
+                hasPendingTurn = false;
                 nextAxis = "";
+                ResetTurnPointTracking();
+                return;
+            }
+
+            if (signedDistance > turnTolerance)
+            {
+                return;
             }
         }
         else
         {
-            var direction = nextAxis[0];
-            var currentDirectionPosition = 0f;
-            if (direction == 'x')
-            {
-                currentDirectionPosition = transform.position.z;
-            }
-            else
-            //else if(direction == 'z')
-            {
-                currentDirectionPosition = transform.position.x;
-            }
-            const float umbral = 0.1f;
+            float actual_step = Vector2.Distance(playerXZ, previousTurnSamplePosition);
+            float configured_step = Mathf.Max(player_data.regularSpeed, player_data.boostedSpeed) * Time.fixedDeltaTime;
+            float allowed_correction = Mathf.Min(actual_step + turnTolerance, configured_step + turnTolerance);
+            float overshoot = Mathf.Max(0f, -signedDistance);
 
-            if (Mathf.Abs(currentDirectionPosition - nextCenter) < umbral)
+            bool condition_a = previousTurnSignedDistance > 0f && signedDistance <= 0f;
+            bool condition_b = previousTurnSignedDistance >= -turnTolerance && previousTurnSignedDistance > signedDistance && signedDistance < -turnTolerance;
+
+            if (condition_a || condition_b)
             {
-                Vector3 exactPosition;
-                if (direction == 'x')
+                if (overshoot <= allowed_correction)
                 {
-                    exactPosition = new Vector3(transform.position.x, transform.position.y, nextCenter);
+                    turnPointCrossed = true;
                 }
                 else
-                //else if(direction == 'z')
                 {
-                    exactPosition = new Vector3(nextCenter, transform.position.y, transform.position.z);
+                    Debug.LogWarning("cornerTurning: Crossing overshoot exceeded permitted correction distance (overshoot=" + overshoot + ", allowed=" + allowed_correction + "). Cancelling pending turn.");
+                    hasPendingTurn = false;
+                    nextAxis = "";
+                    ResetTurnPointTracking();
+                    return;
                 }
-                transform.position = exactPosition;
-                rotationDegrees = getRotationDegrees();
-                //Quaternion targetRotation = Quaternion.Euler(transform.rotation.eulerAngles.x, transform.rotation.eulerAngles.y + rotationDegrees, transform.rotation.eulerAngles.z);
-                //player_rigidbody.MoveRotation(targetRotation);
-                forceStop = true;
-                currentAxis = nextAxis;
-                StartCoroutine(TurnRotation());
-                currentRail = nextCenter;
-                previousRail = currentRail;
-                leftCounter = 0;
-                rightCounter = 0;
-                GameMaster.Instance.cameraRotation = rotationDegrees;
-                previousComposeRail = Vector3.zero;
-                currentComposeRail = Vector3.zero;
+            }
+            else if (!turnPointCrossed && signedDistance < -turnTolerance)
+            {
+                Debug.LogWarning("cornerTurning: Passed intersection without safe crossing (signedDistance=" + signedDistance + "). Cancelling pending turn.");
+                hasPendingTurn = false;
                 nextAxis = "";
+                ResetTurnPointTracking();
+                return;
             }
         }
-            
+
+        bool turnPointReached = Mathf.Abs(signedDistance) <= turnTolerance || turnPointCrossed;
+
+        if (!turnPointReached)
+        {
+            if (signedDistance > turnTolerance)
+            {
+                previousTurnSignedDistance = signedDistance;
+                previousTurnSamplePosition = playerXZ;
+                previousTurnLaneIndex = laneIndex;
+                return;
+            }
+
+            Debug.LogWarning("cornerTurning: Turn point not reached and signedDistance < -turnTolerance. Cancelling pending turn.");
+            hasPendingTurn = false;
+            nextAxis = "";
+            ResetTurnPointTracking();
+            return;
+        }
+
+        if (leftTimer > 0f || rightTimer > 0f || slideTimer > 0f)
+        {
+            previousTurnSignedDistance = signedDistance;
+            previousTurnSamplePosition = playerXZ;
+            previousTurnLaneIndex = laneIndex;
+            return;
+        }
+
+        rotationDegrees = getRotationDegrees();
+        transform.position = new Vector3(target.x, transform.position.y, target.z);
+        isTurning = true;
+        forceStop = true;
+        GameMaster.Instance.activeInput = false;
+        currentAxis = nextAxis;
+
+        for (int i = 0; i < 5; i++)
+        {
+            composeCenters[i] = nextComposeRails[i];
+        }
+
+        leftCounter = -rightCounter;
+        currentComposeRailIndex = rightCounter + 2;
+
+        currentRail = getCurrentRail();
+        previousRail = currentRail;
+        currentComposeRail = getCurrentComposeRail();
+        previousComposeRail = currentComposeRail;
+
+        GameMaster.Instance.cameraRotation = rotationDegrees;
+        hasPendingTurn = false;
+        StartCoroutine(TurnRotation());
     }
 
     IEnumerator TurnRotation()
@@ -636,22 +837,20 @@ public class playerController : MonoBehaviour
         Quaternion finalRotation = Quaternion.Euler(transform.rotation.eulerAngles.x, startAngle + rotationDegrees, transform.rotation.eulerAngles.z);
         transform.rotation = finalRotation;
 
-        if (currentAxis.Length == 2) 
-        {
-            transform.position = new Vector3(
-                currentAxis[0] == 'z' ? nextCenter : transform.position.x,
-                transform.position.y,
-                currentAxis[0] == 'x' ? nextCenter : transform.position.z
-            ); 
-        }
-        else
-        {
-            transform.position = new Vector3(nextComposeCenter.x, transform.position.y, nextComposeCenter.z);
-        }
         forceStop = false;
+        isTurning = false;
+        GameMaster.Instance.activeInput = true;
+
+        nextAxis = "";
         nextCenter = 0f;
         nextComposeCenter = Vector3.zero;
-        GameMaster.Instance.activeInput = true;
+        hasPendingTurn = false;
+        for (int i = 0; i < 5; i++)
+        {
+            nextTurnPoints[i] = Vector3.zero;
+            nextComposeRails[i] = Vector3.zero;
+        }
+        ResetTurnPointTracking();
     }
 
 
